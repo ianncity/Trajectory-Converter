@@ -15,20 +15,152 @@ tokenizer = tiktoken.get_encoding("cl100k_base")
 def count_tokens(text: str) -> int:
     return len(tokenizer.encode(str(text)))
 
+def normalize_role(role: str) -> str:
+    """Normalize role names to standard format: system, user, assistant"""
+    if not role:
+        return "user"
+    
+    role_lower = role.lower().strip()
+    
+    # Map various role representations to standard format
+    role_mappings = {
+        # System variations
+        "system": "system",
+        "sys": "system", 
+        "s": "system",
+        "context": "system",
+        "instruction": "system",
+        
+        # User variations  
+        "user": "user",
+        "human": "user",
+        "human_user": "user",
+        "u": "user",
+        "customer": "user",
+        "client": "user",
+        "question": "user",
+        "query": "user",
+        
+        # Assistant variations
+        "assistant": "assistant",
+        "ai": "assistant",
+        "bot": "assistant", 
+        "a": "assistant",
+        "agent": "assistant",
+        "model": "assistant",
+        "response": "assistant",
+        "answer": "assistant",
+        "completion": "assistant"
+    }
+    
+    # Direct mapping
+    if role_lower in role_mappings:
+        return role_mappings[role_lower]
+    
+    # Fuzzy matching for partial matches
+    if "system" in role_lower or "context" in role_lower or "instruction" in role_lower:
+        return "system"
+    elif "user" in role_lower or "human" in role_lower or "customer" in role_lower:
+        return "user"  
+    elif "assistant" in role_lower or "ai" in role_lower or "bot" in role_lower or "agent" in role_lower:
+        return "assistant"
+    
+    # Default fallback
+    return "user"
+
 def extract_messages(data: Any) -> List[Dict[str, str]]:
     """Extract messages from the file."""
     if isinstance(data, dict) and 'messages' in data:
-        messages = data['messages']
-        if isinstance(messages, list):
-            return messages
+        messages_field = data['messages']
+        
+        # Handle case where messages is a JSON string that needs to be parsed
+        if isinstance(messages_field, str):
+            try:
+                messages_array = json.loads(messages_field)
+                if isinstance(messages_array, list):
+                    normalized_messages = []
+                    for msg in messages_array:
+                        if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                            # Normalize the role and ensure content exists
+                            normalized_msg = {
+                                'role': normalize_role(msg['role']),
+                                'content': msg.get('content', '')
+                            }
+                            normalized_messages.append(normalized_msg)
+                    return normalized_messages
+            except json.JSONDecodeError:
+                pass
+        elif isinstance(messages_field, list):
+            normalized_messages = []
+            for msg in messages_field:
+                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                    # Normalize the role and ensure content exists
+                    normalized_msg = {
+                        'role': normalize_role(msg['role']),
+                        'content': msg.get('content', '')
+                    }
+                    normalized_messages.append(normalized_msg)
+            return normalized_messages
+    
     return []
 
-def create_chain_of_thought_segments(messages: List[Dict[str, str]], 
-                                   target_tokens: int = 6144,
-                                   target_preservation: float = 80.0) -> List[Dict[str, Any]]:
+def load_trajectory_file(file_path: Path) -> List[Dict[str, str]]:
+    """Load trajectory file (handles both JSON and JSONL formats)."""
+    all_messages = []
+    
+    try:
+        # First, try to read as JSONL (line by line)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if line:  # Skip empty lines
+                        try:
+                            data = json.loads(line)
+                            messages = extract_messages(data)
+                            if messages:
+                                all_messages.extend(messages)
+                        except json.JSONDecodeError as e:
+                            print(f"    Warning: JSON decode error on line {line_num}: {e}")
+                            continue
+            return all_messages
+        except Exception:
+            # If JSONL fails, try as regular JSON
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return extract_messages(data)
+    
+    except Exception as e:
+        raise Exception(f"Failed to load trajectory file: {str(e)}")
+
+def is_substantial_content(content: str) -> bool:
+    """Check if content is substantial enough to include (filters boilerplate)."""
+    if not content or len(content.strip()) < 50:
+        return False
+    
+    # Skip obvious boilerplate
+    boilerplate_phrases = [
+        "thank you", "thanks", "you're welcome", "my pleasure",
+        "glad to help", "hope this helps", "let me know if",
+        "is there anything else", "feel free to ask",
+        "good question", "excellent question", "that's a great question"
+    ]
+    
+    content_lower = content.lower()
+    boilerplate_count = sum(1 for phrase in boilerplate_phrases if phrase in content_lower)
+    
+    # If more than 30% of content is boilerplate, skip it
+    if boilerplate_count > 0 and len(content) < 200:
+        return False
+    
+    return True
+
+def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]], 
+                                           target_tokens: int = 6144,
+                                           target_preservation: float = 70.0) -> List[Dict[str, Any]]:
     """
-    Create longer segments optimized for chain of thought learning.
-    Combines multiple neighboring assistant responses up to 6144 tokens.
+    Create focused segments optimized for chain of thought learning.
+    Filters out boilerplate and focuses on substantial reasoning content.
     """
     if not messages:
         return []
@@ -41,7 +173,7 @@ def create_chain_of_thought_segments(messages: List[Dict[str, str]],
     
     print(f"  Found {len(assistant_indices)} assistant messages")
     
-    # Calculate target total tokens based on higher preservation rate for CoT learning
+    # Calculate target total tokens based on preservation rate
     original_messages_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages])
     original_tokens = count_tokens(original_messages_text)
     target_total_tokens = int(original_tokens * (target_preservation / 100.0))
@@ -51,102 +183,113 @@ def create_chain_of_thought_segments(messages: List[Dict[str, str]],
     print(f"  Target total tokens: {target_total_tokens}")
     print(f"  Max tokens per segment: {target_tokens}")
     
-    # Strategy: Create large segments by combining multiple assistant responses
+    # Strategy: Create focused segments by selecting substantial content
     used_indices = set()
     total_generated_tokens = 0
+    tokens_remaining = target_total_tokens
+    
+    # Filter for substantial assistant messages
+    substantial_assistants = []
+    for idx in assistant_indices:
+        msg = messages[idx]
+        if is_substantial_content(msg.get('content', '')):
+            substantial_assistants.append(idx)
+    
+    print(f"  Found {len(substantial_assistants)} substantial assistant responses")
     
     i = 0
-    while i < len(assistant_indices):
-        if assistant_indices[i] in used_indices:
+    while i < len(substantial_assistants) and tokens_remaining > 1000:
+        assistant_idx = substantial_assistants[i]
+        
+        if assistant_idx in used_indices:
             i += 1
             continue
         
-        # Start a new segment from this assistant
-        current_assistant_idx = assistant_indices[i]
-        segment_start = max(0, current_assistant_idx - 2)  # Include some context before
+        # Find optimal segment size for this assistant
+        best_segment = None
+        best_tokens = 0
+        best_start = max(0, assistant_idx - 3)  # More context before
+        best_end = assistant_idx + 1
         
-        # Determine the end of this segment
-        segment_end = current_assistant_idx + 1  # Include this assistant response
-        
-        # Try to expand the segment to include more assistant responses
-        j = i + 1
-        while j < len(assistant_indices):
-            next_assistant_idx = assistant_indices[j]
-            
-            # Check if adding the next assistant response would exceed token limit
-            test_end = next_assistant_idx + 1
-            test_segment_msgs = messages[segment_start:test_end]
-            test_text = "\n".join([f"{m['role']}: {m['content']}" for m in test_segment_msgs])
-            test_tokens = count_tokens(test_text)
-            
-            if test_tokens <= target_tokens:
-                segment_end = test_end
-                j += 1
-            else:
-                break
-        
-        # Create the segment
-        segment_msgs = messages[segment_start:segment_end]
-        
-        # Find the target assistant message (the last one in this segment)
-        target_msg = None
-        target_idx_in_segment = -1
-        for k, msg in enumerate(segment_msgs):
-            if msg.get('role') == 'assistant' and messages.index(msg) == assistant_indices[j-1]:
-                target_msg = msg
-                target_idx_in_segment = k
-                break
-        
-        # If we didn't find the exact target, use the last assistant in the segment
-        if not target_msg:
-            for k in range(len(segment_msgs) - 1, -1, -1):
-                if segment_msgs[k].get('role') == 'assistant':
-                    target_msg = segment_msgs[k]
-                    target_idx_in_segment = k
-                    break
-        
-        if target_msg and target_idx_in_segment > 0:  # Need some context before assistant
-            context = segment_msgs[:target_idx_in_segment]
-            
-            segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
-            segment_tokens = count_tokens(segment_text)
-            
-            # Only create segment if it has substantial content
-            if segment_tokens >= 1000:  # Minimum 1000 tokens for meaningful CoT learning
-                segments.append({
-                    'input_context': context,
-                    'target_action': target_msg['content'],
-                    'metadata': {
-                        'segment_tokens': segment_tokens,
-                        'start_idx': segment_start,
-                        'end_idx': segment_end,
-                        'assistant_index': segment_start + target_idx_in_segment,
-                        'segment_type': 'chain_of_thought',
-                        'context_length': len(context),
-                        'target_length': len(target_msg['content']) if target_msg['content'] else 0,
-                        'num_assistants_in_segment': sum(1 for msg in segment_msgs if msg.get('role') == 'assistant')
-                    }
-                })
+        # Try different segment sizes
+        for context_before in range(1, min(6, assistant_idx + 1)):
+            for context_after in range(1, 4):
+                start_idx = max(0, assistant_idx - context_before)
+                end_idx = min(len(messages), assistant_idx + context_after + 1)
                 
-                total_generated_tokens += segment_tokens
-                used_indices.update(range(segment_start, segment_end))
+                # Skip if any indices are already used
+                range_indices = set(range(start_idx, end_idx))
+                if used_indices.intersection(range_indices):
+                    continue
                 
-                print(f"    Created CoT segment: {segment_tokens} tokens, {len(context)} context messages, {sum(1 for msg in segment_msgs if msg.get('role') == 'assistant')} assistants")
+                segment_msgs = messages[start_idx:end_idx]
                 
-                # Move to the next unprocessed assistant
-                i = j
-            else:
-                # If segment is too small, create a minimal one
-                context_start = max(0, current_assistant_idx - 3)
-                context_end = min(len(messages), current_assistant_idx + 2)
+                # Ensure we have context and the target assistant
+                context_msgs = [msg for msg in segment_msgs if msg.get('role') != 'assistant']
+                assistant_msgs = [msg for msg in segment_msgs if msg.get('role') == 'assistant']
                 
-                context_msgs = messages[context_start:current_assistant_idx]
-                segment_msgs = messages[context_start:context_end]
+                if not context_msgs or assistant_idx not in [messages.index(msg) for msg in assistant_msgs]:
+                    continue
                 
                 segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
                 segment_tokens = count_tokens(segment_text)
                 
-                if segment_tokens >= 500:  # Lower threshold for small segments
+                # Prefer segments that use tokens efficiently and fit remaining budget
+                if (segment_tokens <= min(target_tokens, tokens_remaining) and 
+                    segment_tokens > best_tokens and 
+                    segment_tokens >= 800):  # Minimum substantial segment
+                    
+                    best_segment = segment_msgs
+                    best_tokens = segment_tokens
+                    best_start = start_idx
+                    best_end = end_idx
+        
+        # Create the best segment found
+        if best_segment and best_tokens >= 800:
+            target_msg = messages[assistant_idx]
+            context = [msg for msg in best_segment if msg.get('role') != 'assistant']
+            
+            segments.append({
+                'input_context': context,
+                'target_action': target_msg['content'],
+                'metadata': {
+                    'segment_tokens': best_tokens,
+                    'start_idx': best_start,
+                    'end_idx': best_end,
+                    'assistant_index': assistant_idx,
+                    'segment_type': 'focused_coT',
+                    'context_length': len(context),
+                    'target_length': len(target_msg['content']) if target_msg['content'] else 0,
+                    'num_assistants_in_segment': 1,
+                    'quality_filter': 'substantial_content',
+                    'role_normalization': True
+                }
+            })
+            
+            total_generated_tokens += best_tokens
+            tokens_remaining -= best_tokens
+            used_indices.update(range(best_start, best_end))
+            
+            print(f"    Created focused CoT segment: {best_tokens} tokens, {len(context)} context messages")
+            i += 1
+        else:
+            # Try with minimal context if no good segment found
+            context_start = max(0, assistant_idx - 2)
+            context_end = min(len(messages), assistant_idx + 2)
+            
+            context_msgs = messages[context_start:assistant_idx]
+            segment_msgs = messages[context_start:context_end]
+            
+            # Check if this creates a substantial segment
+            target_msg = messages[assistant_idx]
+            if (len(context_msgs) > 0 and 
+                not used_indices.intersection(range(context_start, context_end)) and
+                is_substantial_content(target_msg.get('content', ''))):
+                
+                segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
+                segment_tokens = count_tokens(segment_text)
+                
+                if segment_tokens >= 500 and segment_tokens <= tokens_remaining:
                     segments.append({
                         'input_context': context_msgs,
                         'target_action': target_msg['content'],
@@ -154,30 +297,33 @@ def create_chain_of_thought_segments(messages: List[Dict[str, str]],
                             'segment_tokens': segment_tokens,
                             'start_idx': context_start,
                             'end_idx': context_end,
-                            'assistant_index': current_assistant_idx,
-                            'segment_type': 'minimal_coT',
+                            'assistant_index': assistant_idx,
+                            'segment_type': 'minimal_focused',
                             'context_length': len(context_msgs),
                             'target_length': len(target_msg['content']) if target_msg['content'] else 0,
-                            'num_assistants_in_segment': 1
+                            'num_assistants_in_segment': 1,
+                            'quality_filter': 'minimal_substantial',
+                            'role_normalization': True
                         }
                     })
                     
                     total_generated_tokens += segment_tokens
+                    tokens_remaining -= segment_tokens
                     used_indices.update(range(context_start, context_end))
                     
-                    print(f"    Created minimal CoT segment: {segment_tokens} tokens, {len(context_msgs)} context messages")
+                    print(f"    Created minimal focused segment: {segment_tokens} tokens")
                     i += 1
                 else:
                     i += 1
-        else:
-            i += 1
+            else:
+                i += 1
     
     # Sort segments by start_idx
     segments.sort(key=lambda x: x['metadata']['start_idx'])
     
     print(f"  Total generated tokens: {total_generated_tokens}")
     print(f"  Actual preservation: {(total_generated_tokens / original_tokens * 100):.1f}%")
-    print(f"  Number of CoT segments: {len(segments)}")
+    print(f"  Number of focused CoT segments: {len(segments)}")
     
     return segments
 
@@ -200,12 +346,8 @@ def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]
     }
     
     try:
-        # Load file
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Extract messages
-        messages = extract_messages(data)
+        # Load file (handles both JSON and JSONL)
+        messages = load_trajectory_file(file_path)
         
         if not messages:
             result['error'] = "No messages found"
@@ -213,8 +355,15 @@ def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]
         
         print(f"  Messages: {len(messages)}, Assistant: {sum(1 for m in messages if m.get('role') == 'assistant')}")
         
-        # Create segments optimized for chain of thought learning
-        segments = create_chain_of_thought_segments(messages)
+        # Show role distribution for verification
+        role_counts = {}
+        for msg in messages:
+            role = msg.get('role', 'unknown')
+            role_counts[role] = role_counts.get(role, 0) + 1
+        print(f"  Role distribution: {role_counts}")
+        
+        # Create focused segments optimized for chain of thought learning
+        segments = create_focused_chain_of_thought_segments(messages)
         
         if not segments:
             result['error'] = "Could not create segments"
@@ -237,7 +386,8 @@ def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]
         result['output_file'] = str(output_file)
         result['original_tokens'] = original_tokens
         
-        print(f"  Created {len(segments)} final CoT segments, {preservation:.1f}% preservation")
+        print(f"  Created {len(segments)} final focused CoT segments, {preservation:.1f}% preservation")
+        print(f"  Role normalization: Applied to all messages")
         
         # Show segment types and token stats
         segment_types = {}
@@ -432,7 +582,7 @@ def main():
                 return 1
         
         elif mode == "help" or mode == "-h" or mode == "--help":
-            print("TrajectoryScraper - Chain of Thought Optimized Version")
+            print("TrajectoryScraper - Focused Chain of Thought Version")
             print("="*60)
             print("Usage:")
             print("  python TrajectoryScraper_final.py              # Run trajectory segmentation")
@@ -440,20 +590,22 @@ def main():
             print("  python TrajectoryScraper_final.py export [file] # Export to custom file")
             print("  python TrajectoryScraper_final.py help         # Show this help")
             print("\nModes:")
-            print("  (default)  - Process trajectory files with CoT-optimized segmentation")
+            print("  (default)  - Process trajectory files with focused CoT segmentation")
             print("  export     - Export all workspace files to JSONL format")
-            print("\nCoT Features:")
-            print("  - Combines multiple neighboring segments up to 6144 tokens")
-            print("  - Optimized for chain of thought learning")
-            print("  - Higher preservation rate (80% vs 60%)")
-            print("  - Groups multiple assistant responses for better coherence")
+            print("\nFocused CoT Features:")
+            print("  - Filters out boilerplate and back-and-forth conversation")
+            print("  - Target preservation: 70% (focuses on substantial content)")
+            print("  - Role normalization: Converts to system/user/assistant format")
+            print("  - Supports both JSON and JSONL input formats")
+            print("  - Optimized for high-quality chain of thought training")
             return 0
     
     # Default mode: trajectory segmentation
     print("="*80)
-    print("CHAIN OF THOUGHT OPTIMIZED TRAJECTORY SEGMENTATION")
-    print("Combines neighboring segments up to 6144 tokens for better reasoning")
-    print("Target preservation: 80% (increased from 60% for CoT learning)")
+    print("FOCUSED CHAIN OF THOUGHT TRAJECTORY SEGMENTATION")
+    print("Filters boilerplate and focuses on substantial reasoning content")
+    print("Target preservation: 70% (selects best content for CoT learning)")
+    print("Role normalization: Converts all roles to system/user/assistant format")
     print("="*80)
     
     # Find JSON files
@@ -499,11 +651,11 @@ def main():
         print(f"Average segments per file: {avg_segments:.1f}")
         print(f"Average preservation: {avg_preservation:.1f}%")
         
-        # Verify preservation target (now 80% for CoT learning)
-        if 70.0 <= avg_preservation <= 90.0:
-            print(f"OK Preservation rate WITHIN target range (70-90% for CoT)")
+        # Verify preservation target (70% for focused CoT learning)
+        if 65.0 <= avg_preservation <= 75.0:
+            print(f"OK Preservation rate WITHIN target range (65-75% for focused CoT)")
         else:
-            print(f"! Preservation rate: {avg_preservation:.1f}% (target: 70-90% for CoT)")
+            print(f"! Preservation rate: {avg_preservation:.1f}% (target: 65-75% for focused CoT)")
         
         # Show file details
         print(f"\nFile details:")
@@ -519,6 +671,7 @@ def main():
             print(f"  {result['file']}: {result['error']}")
     
     print(f"\nOutput directory: {output_dir}")
+    print(f"Role normalization: Applied to all segments")
 
 if __name__ == "__main__":
     exit(main())
