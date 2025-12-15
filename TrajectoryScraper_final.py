@@ -210,12 +210,86 @@ def is_substantial_content(content: str) -> bool:
     
     return True
 
-def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]], 
+def find_natural_stop_point(content: str, target_tokens: int) -> int:
+    """
+    Find a natural stopping point in content after reaching target tokens.
+    Looks for sentence endings, paragraph breaks, or logical conclusion points.
+    """
+    if len(content) <= target_tokens * 4:  # Rough token to character ratio
+        return len(content)
+    
+    # Check for natural stopping points in the last portion of content
+    search_start = max(0, len(content) - target_tokens * 6)  # Search last ~6000 chars
+    
+    # Priority order for natural stopping points
+    stop_patterns = [
+        # Conclusion indicators
+        r'[.!?]\s*$',  # End of sentence
+        r'\n\s*$',     # End of paragraph
+        r'Therefore[,.\s]',
+        r'In conclusion[,.\s]',
+        r'To summarize[,.\s]',
+        r'In summary[,.\s]',
+        r'Overall[,.\s]',
+        
+        # Code block endings
+        r'```\s*$',
+        r'\}\s*$',     # End of code object
+        r'\]\s*$',     # End of array/object
+        
+        # Question transitions
+        r'\?\s*$',     # End of question
+        r'\n\s*Q:',    # New question
+        r'\n\s*Next:',
+        
+        # Step completions
+        r'Step \d+[:.\s]',
+        r'Finally[,.\s]',
+        r'Last[,.\s]',
+        
+        # Natural breaks
+        r'\n\s*\n',    # Double newline
+        r'[:.!?]\s+\n', # Sentence end followed by newline
+    ]
+    
+    # Search for the best stopping point
+    for pattern in stop_patterns:
+        import re
+        matches = list(re.finditer(pattern, content[search_start:], re.IGNORECASE))
+        if matches:
+            # Return the position of the first good match
+            match = matches[0]
+            return search_start + match.end()
+    
+    # If no good pattern found, cut at a sentence boundary near target
+    sentences = re.split(r'[.!?]+\s+', content[search_start:])
+    if len(sentences) > 1:
+        # Find the sentence that gets us closest to target without exceeding it
+        cumulative_length = search_start
+        for sentence in sentences:
+            sentence_end = cumulative_length + len(sentence) + 2  # +2 for punctuation and space
+            if sentence_end <= target_tokens * 4.5:  # Allow some buffer
+                cumulative_length = sentence_end
+            else:
+                break
+        return cumulative_length
+    
+    # Fallback: cut at word boundary near target
+    words = content[search_start:].split()
+    cumulative_length = search_start
+    for word in words:
+        if cumulative_length + len(word) + 1 <= target_tokens * 4.5:
+            cumulative_length += len(word) + 1
+        else:
+            break
+    return cumulative_length
+
+def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                                            target_tokens: int = 6144,
                                            target_preservation: float = 70.0) -> List[Dict[str, Any]]:
     """
     Create focused segments optimized for chain of thought learning.
-    Filters out boilerplate and focuses on substantial reasoning content.
+    Uses intelligent stopping: looks for natural breaks after 5000 tokens, max 6144.
     """
     if not messages:
         return []
@@ -237,8 +311,9 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
     print(f"  Target preservation: {target_preservation}%")
     print(f"  Target total tokens: {target_total_tokens}")
     print(f"  Max tokens per segment: {target_tokens}")
+    print(f"  Smart stopping: Look for natural breaks after 5000 tokens")
     
-    # Strategy: Create focused segments by selecting substantial content
+    # Strategy: Create focused segments with intelligent stopping
     used_indices = set()
     total_generated_tokens = 0
     tokens_remaining = target_total_tokens
@@ -260,15 +335,15 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
             i += 1
             continue
         
-        # Find optimal segment size for this assistant
+        # Build segment progressively with smart stopping
         best_segment = None
         best_tokens = 0
-        best_start = max(0, assistant_idx - 3)  # More context before
+        best_start = max(0, assistant_idx - 3)
         best_end = assistant_idx + 1
         
-        # Try different segment sizes
-        for context_before in range(1, min(6, assistant_idx + 1)):
-            for context_after in range(1, 4):
+        # Try building segments with different context sizes
+        for context_before in range(1, min(8, assistant_idx + 1)):  # More context options
+            for context_after in range(1, 5):  # More future context options
                 start_idx = max(0, assistant_idx - context_before)
                 end_idx = min(len(messages), assistant_idx + context_after + 1)
                 
@@ -289,15 +364,24 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                 segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
                 segment_tokens = count_tokens(segment_text)
                 
-                # Prefer segments that use tokens efficiently and fit remaining budget
-                if (segment_tokens <= min(target_tokens, tokens_remaining) and 
-                    segment_tokens > best_tokens and 
-                    segment_tokens >= 800):  # Minimum substantial segment
+                # Smart stopping logic: prefer segments near 5000 tokens with natural breaks
+                if segment_tokens >= 800 and segment_tokens <= target_tokens:
+                    # Check if this would be a good stopping point
+                    is_smart_stop = segment_tokens >= 5000
                     
-                    best_segment = segment_msgs
-                    best_tokens = segment_tokens
-                    best_start = start_idx
-                    best_end = end_idx
+                    # Score segments: prefer smart stops, then larger segments, then efficiency
+                    score = 0
+                    if is_smart_stop:
+                        score += 1000  # Heavy bonus for smart stopping points
+                    score += segment_tokens / 10  # Prefer larger segments
+                    score += (min(target_tokens, tokens_remaining) - segment_tokens) / 100  # Efficiency bonus
+                    
+                    if score > best_tokens:  # Using best_tokens as score storage
+                        best_segment = segment_msgs
+                        best_tokens = score  # Store score, not token count
+                        best_start = start_idx
+                        best_end = end_idx
+                        best_token_count = segment_tokens  # Store actual token count
         
         # Create the best segment found
         if best_segment and best_tokens >= 800:
@@ -308,24 +392,26 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                 'input_context': context,
                 'target_action': target_msg['content'],
                 'metadata': {
-                    'segment_tokens': best_tokens,
+                    'segment_tokens': best_token_count,
                     'start_idx': best_start,
                     'end_idx': best_end,
                     'assistant_index': assistant_idx,
-                    'segment_type': 'focused_coT',
+                    'segment_type': 'smart_stop_coT' if best_token_count >= 5000 else 'focused_coT',
                     'context_length': len(context),
                     'target_length': len(target_msg['content']) if target_msg['content'] else 0,
                     'num_assistants_in_segment': 1,
                     'quality_filter': 'substantial_content',
-                    'role_normalization': True
+                    'role_normalization': True,
+                    'smart_stopping': best_token_count >= 5000
                 }
             })
             
-            total_generated_tokens += best_tokens
-            tokens_remaining -= best_tokens
+            total_generated_tokens += best_token_count
+            tokens_remaining -= best_token_count
             used_indices.update(range(best_start, best_end))
             
-            print(f"    Created focused CoT segment: {best_tokens} tokens, {len(context)} context messages")
+            stop_type = "smart stop" if best_token_count >= 5000 else "focused"
+            print(f"    Created {stop_type} segment: {best_token_count} tokens, {len(context)} context messages")
             i += 1
         else:
             # Try with minimal context if no good segment found
@@ -335,16 +421,14 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
             context_msgs = messages[context_start:assistant_idx]
             segment_msgs = messages[context_start:context_end]
             
-            # Check if this creates a substantial segment
-            target_msg = messages[assistant_idx]
-            if (len(context_msgs) > 0 and 
+            if (len(context_msgs) > 0 and
                 not used_indices.intersection(range(context_start, context_end)) and
                 is_substantial_content(target_msg.get('content', ''))):
                 
                 segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
                 segment_tokens = count_tokens(segment_text)
                 
-                if segment_tokens >= 500 and segment_tokens <= tokens_remaining:
+                if segment_tokens >= 500 and segment_tokens <= min(target_tokens, tokens_remaining):
                     segments.append({
                         'input_context': context_msgs,
                         'target_action': target_msg['content'],
@@ -358,7 +442,8 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                             'target_length': len(target_msg['content']) if target_msg['content'] else 0,
                             'num_assistants_in_segment': 1,
                             'quality_filter': 'minimal_substantial',
-                            'role_normalization': True
+                            'role_normalization': True,
+                            'smart_stopping': False
                         }
                     })
                     
@@ -622,6 +707,97 @@ def export_workspace(output_file: str = "workspace_export.jsonl") -> Dict[str, A
     
     return summary
 
+def process_trajectory_file_to_single_file(file_path: Path, output_file) -> Dict[str, Any]:
+    """Process a trajectory file and write segments directly to single output file."""
+    result = {
+        'file': file_path.name,
+        'success': False,
+        'error': None,
+        'segments': 0,
+        'preservation': 0.0,
+        'file_format': None
+    }
+    
+    try:
+        # Load file with dual JSON/JSONL support and format detection
+        messages, file_format = load_trajectory_file(file_path)
+        
+        if not messages:
+            result['error'] = "No messages found"
+            return result
+        
+        print(f"  Detected format: {file_format}")
+        print(f"  Messages: {len(messages)}, Assistant: {sum(1 for m in messages if m.get('role') == 'assistant')}")
+        
+        # Show role distribution for verification (auto-conversion to system/user/assistant)
+        role_counts = {}
+        for msg in messages:
+            role = msg.get('role', 'unknown')
+            role_counts[role] = role_counts.get(role, 0) + 1
+        print(f"  Role distribution: {role_counts}")
+        print(f"  Auto-role conversion: system/user/assistant format applied")
+        
+        # Create focused segments optimized for chain of thought learning
+        segments = create_focused_chain_of_thought_segments(messages)
+        
+        if not segments:
+            result['error'] = "Could not create segments"
+            return result
+        
+        # Write segments directly to single output file
+        segments_written = 0
+        for segment in segments:
+            json_line = json.dumps(segment, ensure_ascii=False) + '\n'
+            output_file.write(json_line)
+            segments_written += 1
+        
+        # Calculate preservation rate
+        original_messages_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages])
+        original_tokens = count_tokens(original_messages_text)
+        preservation = calculate_preservation_rate(segments, original_tokens)
+        
+        result['success'] = True
+        result['segments'] = segments_written
+        result['preservation'] = preservation
+        result['original_tokens'] = original_tokens
+        result['file_format'] = file_format
+        
+        print(f"  Created {segments_written} segments, {preservation:.1f}% preservation")
+        print(f"  Role normalization: Applied to all messages")
+        print(f"  Smart stopping: Active (natural breaks after 5000 tokens)")
+        
+        # Show segment types and token stats
+        segment_types = {}
+        token_counts = []
+        context_lengths = []
+        target_lengths = []
+        assistant_counts = []
+        smart_stops = 0
+        
+        for s in segments:
+            seg_type = s['metadata']['segment_type']
+            segment_types[seg_type] = segment_types.get(seg_type, 0) + 1
+            token_counts.append(s['metadata']['segment_tokens'])
+            context_lengths.append(s['metadata']['context_length'])
+            target_lengths.append(s['metadata']['target_length'])
+            assistant_counts.append(s['metadata'].get('num_assistants_in_segment', 1))
+            if s['metadata'].get('smart_stopping', False):
+                smart_stops += 1
+        
+        print(f"  Segment types: {segment_types}")
+        print(f"  Smart stopping segments: {smart_stops}/{segments_written}")
+        if token_counts:
+            print(f"  Token stats - Min: {min(token_counts)}, Max: {max(token_counts)}, Avg: {np.mean(token_counts):.0f}")
+            print(f"  Token utilization - Min: {min(token_counts)/6144*100:.1f}%, Max: {max(token_counts)/6144*100:.1f}%, Avg: {np.mean(token_counts)/6144*100:.1f}%")
+            print(f"  Context length - Avg: {np.mean(context_lengths):.1f} messages")
+            print(f"  Target length - Avg: {np.mean(target_lengths):.0f} characters")
+            print(f"  Assistants per segment - Avg: {np.mean(assistant_counts):.1f}")
+        
+    except Exception as e:
+        result['error'] = str(e)
+    
+    return result
+
 def main():
     # Check command line arguments
     if len(sys.argv) > 1:
@@ -647,17 +823,20 @@ def main():
                 return 1
         
         elif mode == "help" or mode == "-h" or mode == "--help":
-            print("TrajectoryScraper - Focused Chain of Thought Version")
-            print("="*60)
+            print("TrajectoryScraper - Smart Stopping Chain of Thought Version")
+            print("="*70)
             print("Usage:")
             print("  python TrajectoryScraper_final.py              # Run trajectory segmentation")
             print("  python TrajectoryScraper_final.py export       # Export workspace to JSONL")
             print("  python TrajectoryScraper_final.py export [file] # Export to custom file")
             print("  python TrajectoryScraper_final.py help         # Show this help")
             print("\nModes:")
-            print("  (default)  - Process trajectory files with focused CoT segmentation")
+            print("  (default)  - Process trajectory files with smart stopping CoT segmentation")
             print("  export     - Export all workspace files to JSONL format")
-            print("\nFocused CoT Features:")
+            print("\nSmart Stopping Features:")
+            print("  - Looks for natural stopping points after 5000 tokens")
+            print("  - Maximum segment size: 6144 tokens")
+            print("  - All output consolidated to single JSONL file")
             print("  - Filters out boilerplate and back-and-forth conversation")
             print("  - Target preservation: 70% (focuses on substantial content)")
             print("  - Role normalization: Converts to system/user/assistant format")
@@ -665,9 +844,11 @@ def main():
             print("  - Optimized for high-quality chain of thought training")
             return 0
     
-    # Default mode: trajectory segmentation
+    # Default mode: trajectory segmentation with single output file
     print("="*80)
-    print("FOCUSED CHAIN OF THOUGHT TRAJECTORY SEGMENTATION")
+    print("SMART STOPPING CHAIN OF THOUGHT TRAJECTORY SEGMENTATION")
+    print("Looks for natural stopping points after 5000 tokens, max 6144")
+    print("All output consolidated to single JSONL file")
     print("Filters boilerplate and focuses on substantial reasoning content")
     print("Target preservation: 70% (selects best content for CoT learning)")
     print("Role normalization: Converts all roles to system/user/assistant format")
@@ -680,22 +861,27 @@ def main():
     
     # Filter out already processed files
     json_files = [f for f in json_files if not any(
-        s in f.name for s in ['_segmented', '_compressed', '_reasoning', '_highpres', '_debug', '_final']
+        s in f.name for s in ['_segmented', '_compressed', '_reasoning', '_highpres', '_final', 'comprehensive_export']
     )]
     
     print(f"Found {len(json_files)} JSON files to process.")
     
-    # Create output directory
-    output_dir = Path("segmented_trajectories")
-    output_dir.mkdir(exist_ok=True)
+    # Single output file for all segments
+    output_file = Path("consolidated_trajectories.jsonl")
     
     results = []
+    total_segments_written = 0
     
-    for i, file_path in enumerate(json_files, 1):
-        print(f"\n[{i}/{len(json_files)}] Processing: {file_path.name}")
-        
-        result = process_trajectory_file(file_path, output_dir)
-        results.append(result)
+    # Open single output file for all segments
+    with open(output_file, 'w', encoding='utf-8') as out_f:
+        for i, file_path in enumerate(json_files, 1):
+            print(f"\n[{i}/{len(json_files)}] Processing: {file_path.name}")
+            
+            result = process_trajectory_file_to_single_file(file_path, out_f)
+            results.append(result)
+            
+            if result['success']:
+                total_segments_written += result['segments']
     
     # Print summary
     print("\n" + "="*80)
@@ -728,15 +914,17 @@ def main():
             print(f"  {result['file']}:")
             print(f"    - Segments: {result['segments']}")
             print(f"    - Preservation: {result['preservation']:.1f}%")
-            print(f"    - Output: {Path(result['output_file']).name}")
+            print(f"    - Format: {result.get('file_format', 'Unknown')}")
     
     if failed:
         print(f"\nFailed files ({len(failed)}):")
         for result in failed:
             print(f"  {result['file']}: {result['error']}")
     
-    print(f"\nOutput directory: {output_dir}")
+    print(f"\nConsolidated output file: {output_file}")
+    print(f"Total segments written: {total_segments_written}")
     print(f"Role normalization: Applied to all segments")
+    print(f"Smart stopping: Active (natural breaks after 5000 tokens, max 6144)")
 
 if __name__ == "__main__":
     exit(main())
