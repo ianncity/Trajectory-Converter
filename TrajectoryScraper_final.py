@@ -104,34 +104,89 @@ def extract_messages(data: Any) -> List[Dict[str, str]]:
     
     return []
 
-def load_trajectory_file(file_path: Path) -> List[Dict[str, str]]:
-    """Load trajectory file (handles both JSON and JSONL formats)."""
+def load_trajectory_file(file_path: Path) -> tuple[List[Dict[str, str]], str]:
+    """
+    Load trajectory file with dual JSON/JSONL support for LLM training data.
+    
+    Automatically detects and processes both JSON and JSONL formats:
+    - JSON: Single object or array with messages field
+    - JSONL: One JSON object per line (supports multiple trajectories)
+    
+    Returns:
+        Tuple of (messages_list, file_format_detected)
+    """
     all_messages = []
+    file_format = None
     
     try:
-        # First, try to read as JSONL (line by line)
+        # Detect file format and process accordingly
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if line:  # Skip empty lines
-                        try:
-                            data = json.loads(line)
-                            messages = extract_messages(data)
-                            if messages:
-                                all_messages.extend(messages)
-                        except json.JSONDecodeError as e:
-                            print(f"    Warning: JSON decode error on line {line_num}: {e}")
-                            continue
-            return all_messages
-        except Exception:
-            # If JSONL fails, try as regular JSON
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return extract_messages(data)
+                # Read first few lines to detect format
+                first_lines = []
+                for i, line in enumerate(f):
+                    if i < 5:  # Check first 5 lines
+                        first_lines.append(line.strip())
+                    else:
+                        break
+            
+            # JSONL detection: multiple lines, each is a complete JSON object
+            jsonl_indicators = []
+            for line in first_lines:
+                if line and line.startswith('{') and line.endswith('}'):
+                    try:
+                        json.loads(line)
+                        jsonl_indicators.append(True)
+                    except json.JSONDecodeError:
+                        jsonl_indicators.append(False)
+            
+            # If most lines are valid JSON objects, treat as JSONL
+            if len(jsonl_indicators) > 0 and sum(jsonl_indicators) >= len(jsonl_indicators) * 0.6:
+                file_format = "JSONL"
+                return load_jsonl_format(file_path, all_messages), file_format
+            else:
+                file_format = "JSON"
+                return load_json_format(file_path, all_messages), file_format
+                
+        except Exception as e:
+            # Fallback: try JSON format first, then JSONL
+            try:
+                file_format = "JSON (fallback)"
+                return load_json_format(file_path, all_messages), file_format
+            except Exception:
+                file_format = "JSONL (fallback)"
+                return load_jsonl_format(file_path, all_messages), file_format
     
     except Exception as e:
-        raise Exception(f"Failed to load trajectory file: {str(e)}")
+        raise Exception(f"Failed to load trajectory file ({file_format}): {str(e)}")
+
+def load_json_format(file_path: Path, all_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Load single JSON file (object or array)."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+        messages = extract_messages(data)
+        all_messages.extend(messages)
+    return all_messages
+
+def load_jsonl_format(file_path: Path, all_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Load JSONL file (one JSON object per line)."""
+    line_count = 0
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            line_count += 1
+            if line:  # Skip empty lines
+                try:
+                    data = json.loads(line)
+                    messages = extract_messages(data)
+                    if messages:
+                        all_messages.extend(messages)
+                except json.JSONDecodeError as e:
+                    print(f"    Warning: JSON decode error on line {line_num}: {e}")
+                    continue
+    
+    print(f"    Processed {line_count} lines from JSONL file")
+    return all_messages
 
 def is_substantial_content(content: str) -> bool:
     """Check if content is substantial enough to include (filters boilerplate)."""
@@ -336,31 +391,39 @@ def calculate_preservation_rate(segments: List[Dict[str, Any]], original_tokens:
     return (total_tokens / original_tokens * 100) if original_tokens > 0 else 0
 
 def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]:
-    """Process a single trajectory file."""
+    """
+    Process a single trajectory file with dual JSON/JSONL support.
+    
+    Automatically detects JSON vs JSONL format and applies role normalization
+    for system/user/assistant conversion.
+    """
     result = {
         'file': file_path.name,
         'success': False,
         'error': None,
         'segments': 0,
-        'preservation': 0.0
+        'preservation': 0.0,
+        'file_format': None
     }
     
     try:
-        # Load file (handles both JSON and JSONL)
-        messages = load_trajectory_file(file_path)
+        # Load file with dual JSON/JSONL support and format detection
+        messages, file_format = load_trajectory_file(file_path)
         
         if not messages:
             result['error'] = "No messages found"
             return result
         
+        print(f"  Detected format: {file_format}")
         print(f"  Messages: {len(messages)}, Assistant: {sum(1 for m in messages if m.get('role') == 'assistant')}")
         
-        # Show role distribution for verification
+        # Show role distribution for verification (auto-conversion to system/user/assistant)
         role_counts = {}
         for msg in messages:
             role = msg.get('role', 'unknown')
             role_counts[role] = role_counts.get(role, 0) + 1
         print(f"  Role distribution: {role_counts}")
+        print(f"  Auto-role conversion: system/user/assistant format applied")
         
         # Create focused segments optimized for chain of thought learning
         segments = create_focused_chain_of_thought_segments(messages)
@@ -369,7 +432,7 @@ def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]
             result['error'] = "Could not create segments"
             return result
         
-        # Save to file
+        # Save to file in JSONL format for LLM training
         output_file = output_dir / f"{file_path.stem}_final.jsonl"
         with open(output_file, 'w', encoding='utf-8') as f:
             for segment in segments:
@@ -385,9 +448,11 @@ def process_trajectory_file(file_path: Path, output_dir: Path) -> Dict[str, Any]
         result['preservation'] = preservation
         result['output_file'] = str(output_file)
         result['original_tokens'] = original_tokens
+        result['file_format'] = file_format
         
         print(f"  Created {len(segments)} final focused CoT segments, {preservation:.1f}% preservation")
         print(f"  Role normalization: Applied to all messages")
+        print(f"  Output format: JSONL for LLM training")
         
         # Show segment types and token stats
         segment_types = {}
