@@ -284,12 +284,110 @@ def find_natural_stop_point(content: str, target_tokens: int) -> int:
             break
     return cumulative_length
 
+def find_optimal_segment_stop(content: str, target_tokens: int = 6000, max_tokens: int = 6144) -> int:
+    """
+    Find the optimal stopping point in content for segment creation.
+    Targets 6000 tokens and looks for natural ending points in code/chat.
+    Hard stops at 6144 tokens.
+    """
+    if len(content) <= target_tokens * 4:  # Rough token to character ratio
+        return len(content)
+    
+    # Check for natural stopping points in the target range
+    search_start = max(0, len(content) - max_tokens * 6)  # Search last ~36000 chars
+    target_char_position = target_tokens * 4  # Rough character position for 6000 tokens
+    
+    # Priority order for natural stopping points in code/chat
+    stop_patterns = [
+        # Code endings (highest priority)
+        r'```\s*$',                    # End of code block
+        r'```[a-zA-Z]*\s*$',          # End of specific code language block
+        r'\n\s*\}\s*$',               # End of code block/function
+        r'\n\s*\]\s*$',               # End of array/object
+        r'\n\s*\);\s*$',              # End of statement
+        r'\n\s*\{\s*\}\s*$',          # Empty code block
+        
+        # Conclusion indicators (high priority)
+        r'Therefore[,.\s]',
+        r'In conclusion[,.\s]',
+        r'To summarize[,.\s]',
+        r'In summary[,.\s]',
+        r'Overall[,.\s]',
+        r'Finally[,.\s]',
+        r'In conclusion[:.\s]',
+        
+        # Natural conversation endings
+        r'[.!?]\s*$',                 # End of sentence
+        r'\n\s*$',                    # End of paragraph
+        r'\?\s*$',                    # End of question
+        
+        # Code/Chat specific patterns
+        r'\n\s*#\s*$',                # End of comment section
+        r'\n\s*/\*\s*$',              # End of comment block
+        r'\n\s*```\s*$',              # Code block transition
+        r'\n\s*Step \d+[:.\s]',       # Step completion
+        
+        # Question transitions
+        r'\n\s*Q:',                   # New question
+        r'\n\s*Next:',
+        r'\n\s*Would you like',
+        
+        # Natural breaks
+        r'\n\s*\n',                   # Double newline
+        r'[:.!?]\s+\n',               # Sentence end followed by newline
+    ]
+    
+    # Search for the best stopping point in the target range
+    best_stop = min(target_char_position, len(content))
+    
+    for pattern in stop_patterns:
+        import re
+        matches = list(re.finditer(pattern, content[search_start:], re.IGNORECASE))
+        for match in matches:
+            stop_position = search_start + match.end()
+            
+            # Check if this stopping point is in our target range (within 2% of target)
+            if target_char_position * 0.98 <= stop_position <= target_char_position * 1.02:
+                return stop_position
+            # If no perfect target found, use the first reasonable stop before max
+            elif stop_position <= max_tokens * 4 and stop_position < best_stop:
+                best_stop = stop_position
+    
+    # If no good pattern found, find sentence boundary near target
+    if target_char_position < len(content):
+        target_end_pos = int(min(target_char_position * 1.5, len(content)))
+        sentences = re.split(r'[.!?]+\s+', content[search_start:target_end_pos])
+        if len(sentences) > 1:
+            # Find the sentence that gets us closest to target
+            cumulative_length = search_start
+            for sentence in sentences[:-1]:  # Exclude partial sentence
+                sentence_end = cumulative_length + len(sentence) + 2
+                if sentence_end <= target_char_position * 1.015:
+                    cumulative_length = sentence_end
+                else:
+                    break
+            return cumulative_length
+        
+        # Fallback: cut at word boundary near target but before max
+        target_cutoff = int(min(target_char_position * 1.015, max_tokens * 4))
+        if target_cutoff < len(content):
+            words = content[search_start:target_cutoff].split()
+            cumulative_length = search_start
+            for word in words[:-1]:  # Exclude partial word
+                if cumulative_length + len(word) + 1 <= target_cutoff:
+                    cumulative_length += len(word) + 1
+                else:
+                    break
+            return cumulative_length
+    
+    return min(target_char_position, len(content))
+
 def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                                            target_tokens: int = 6144,
                                            target_preservation: float = 70.0) -> List[Dict[str, Any]]:
     """
     Create focused segments optimized for chain of thought learning.
-    Uses intelligent stopping: looks for natural breaks after 5000 tokens, max 6144.
+    Every segment targets 6000 tokens, looks for natural endings, hard stop at 6144.
     """
     if not messages:
         return []
@@ -311,12 +409,11 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
     print(f"  Target preservation: {target_preservation}%")
     print(f"  Target total tokens: {target_total_tokens}")
     print(f"  Max tokens per segment: {target_tokens}")
-    print(f"  Smart stopping: Look for natural breaks after 5000 tokens")
+    print(f"  Consistent segmentation: Minimum 6000 tokens, natural stops, hard limit 6144")
     
-    # Strategy: Create focused segments with intelligent stopping
+    # Strategy: Create segments with consistent 6000-token targeting
     used_indices = set()
     total_generated_tokens = 0
-    tokens_remaining = target_total_tokens
     
     # Filter for substantial assistant messages
     substantial_assistants = []
@@ -328,22 +425,27 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
     print(f"  Found {len(substantial_assistants)} substantial assistant responses")
     
     i = 0
-    while i < len(substantial_assistants) and tokens_remaining > 1000:
+    segments_created = 0
+    while i < len(substantial_assistants):
         assistant_idx = substantial_assistants[i]
         
         if assistant_idx in used_indices:
             i += 1
             continue
         
-        # Build segment progressively with smart stopping
+        print(f"    Processing assistant {i+1}/{len(substantial_assistants)} (index {assistant_idx})")
+        
+        # Build segment with consistent 6000-token targeting
         best_segment = None
-        best_tokens = 0
         best_start = max(0, assistant_idx - 3)
         best_end = assistant_idx + 1
         
-        # Try building segments with different context sizes
-        for context_before in range(1, min(8, assistant_idx + 1)):  # More context options
-            for context_after in range(1, 5):  # More future context options
+        # Try different context sizes to reach minimum tokens (6000 preferred, 3000 fallback)
+        min_preferred_tokens = 6000
+        min_fallback_tokens = 3000
+        
+        for context_before in range(1, min(20, assistant_idx + 1)):
+            for context_after in range(1, 12):
                 start_idx = max(0, assistant_idx - context_before)
                 end_idx = min(len(messages), assistant_idx + context_after + 1)
                 
@@ -364,99 +466,338 @@ def create_focused_chain_of_thought_segments(messages: List[Dict[str, str]],
                 segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
                 segment_tokens = count_tokens(segment_text)
                 
-                # Smart stopping logic: prefer segments near 5000 tokens with natural breaks
-                if segment_tokens >= 800 and segment_tokens <= target_tokens:
-                    # Check if this would be a good stopping point
-                    is_smart_stop = segment_tokens >= 5000
+                # Check if we meet the preferred 6000 token minimum
+                if segment_tokens >= min_preferred_tokens:
+                    # Apply natural stopping refinement after reaching 6000 tokens
+                    optimal_stop = find_optimal_segment_stop(segment_text)
                     
-                    # Score segments: prefer smart stops, then larger segments, then efficiency
-                    score = 0
-                    if is_smart_stop:
-                        score += 1000  # Heavy bonus for smart stopping points
-                    score += segment_tokens / 10  # Prefer larger segments
-                    score += (min(target_tokens, tokens_remaining) - segment_tokens) / 100  # Efficiency bonus
+                    # If natural stop found and keeps us above 6000, use it
+                    if optimal_stop < len(segment_text):
+                        trimmed_text = segment_text[:optimal_stop]
+                        trimmed_tokens = count_tokens(trimmed_text)
+                        
+                        if trimmed_tokens >= min_preferred_tokens:
+                            best_segment = segment_msgs
+                            best_start = start_idx
+                            best_end = end_idx
+                            best_token_count = trimmed_tokens
+                            best_content = trimmed_text
+                            best_minimum = min_preferred_tokens
+                            break
                     
-                    if score > best_tokens:  # Using best_tokens as score storage
+                    # Use the segment as-is if no natural stop found or below 6000
+                    if not best_segment or segment_tokens > best_token_count:
                         best_segment = segment_msgs
-                        best_tokens = score  # Store score, not token count
                         best_start = start_idx
                         best_end = end_idx
-                        best_token_count = segment_tokens  # Store actual token count
+                        best_token_count = segment_tokens
+                        best_content = segment_text
+                        best_minimum = min_preferred_tokens
+                        
+                        # If we hit the target range (6000-6144), we're done
+                        if min_preferred_tokens <= segment_tokens <= target_tokens:
+                            break
+                
+                # If not enough for 6000, check if we meet the 3000 fallback minimum
+                elif segment_tokens >= min_fallback_tokens and not best_segment:
+                    # Use fallback segment with 3000 minimum
+                    best_segment = segment_msgs
+                    best_start = start_idx
+                    best_end = end_idx
+                    best_token_count = segment_tokens
+                    best_content = segment_text
+                    best_minimum = min_fallback_tokens
+                    # Don't break here - keep looking for better 6000 token segments
         
-        # Create the best segment found
-        if best_segment and best_tokens >= 800:
+        # Create the best segment found (must meet minimum 6000 or 3000 tokens)
+        min_required = best_minimum if 'best_minimum' in locals() else 6000
+        
+        if best_segment and best_token_count >= min_required:
             target_msg = messages[assistant_idx]
             context = [msg for msg in best_segment if msg.get('role') != 'assistant']
             
+            # Apply natural stopping and hard limit enforcement
+            target_content = target_msg['content']
+            final_tokens = best_token_count
+            final_content = 'best_content' in locals() and len(best_content) < len(segment_text)
+            hard_limited = False
+            
+            # Apply natural stopping if segment is over the minimum
+            if best_token_count > min_required:
+                optimal_stop = find_optimal_segment_stop(best_content)
+                
+                # If natural stop found and keeps us above minimum, use it
+                if optimal_stop < len(best_content):
+                    trimmed_text = best_content[:optimal_stop]
+                    trimmed_tokens = count_tokens(trimmed_text)
+                    
+                    if trimmed_tokens >= min_required:
+                        # Update content with trimmed version
+                        context_text = '\n'.join([f"{m['role']}: {m['content']}" for m in context])
+                        context_tokens = count_tokens(context_text)
+                        remaining_for_target = target_tokens - context_tokens
+                        if remaining_for_target > 0 and target_content:
+                            target_char_limit = min(len(target_content), int(remaining_for_target * 4))
+                            target_content = target_content[:target_char_limit]
+                        
+                        final_tokens = trimmed_tokens
+                        final_content = trimmed_text
+            
+            # Apply hard limit enforcement if still over 6144, but only if it keeps us above minimum
+            if final_tokens > target_tokens:
+                # Apply hard limiting and check if result is still above minimum
+                # Simple truncation approach to avoid complex calculations
+                content_to_trim = best_content if not final_content else best_content
+                max_chars = min(len(content_to_trim), 25000)
+                trimmed_segment_text = content_to_trim[:max_chars]
+                test_tokens = count_tokens(trimmed_segment_text)
+                
+                # If still over limit, use a more precise approach
+                if test_tokens > target_tokens:
+                    # Calculate target char count based on token ratio
+                    char_ratio = len(content_to_trim) / test_tokens
+                    target_chars = int(target_tokens * char_ratio * 0.95)  # Add buffer
+                    target_chars = max(1, min(target_chars, len(content_to_trim)))
+                    
+                    trimmed_segment_text = content_to_trim[:target_chars]
+                    test_tokens = count_tokens(trimmed_segment_text)
+                
+                # Only proceed with hard limiting if result is still >= minimum tokens
+                if test_tokens >= min_required:
+                    final_tokens = test_tokens
+                    hard_limited = True
+                    final_content = trimmed_segment_text
+                    
+                    # Trim target content proportionally
+                    context_tokens = count_tokens('\n'.join([f"{m['role']}: {m['content']}" for m in context]))
+                    remaining_for_target = target_tokens - context_tokens
+                    if remaining_for_target > 0 and target_content:
+                        target_char_limit = min(len(target_content), int(remaining_for_target * 4))  # 4 chars per token approx
+                        target_content = target_content[:target_char_limit]
+                else:
+                    # Skip this segment as hard limiting would drop it below minimum tokens
+                    min_note = "6000" if min_required == 6000 else "3000"
+                    print(f"      Skipped segment: would drop below {min_note} tokens after hard limiting")
+                    i += 1
+                    continue
+            
             segments.append({
                 'input_context': context,
-                'target_action': target_msg['content'],
+                'target_action': target_content,
                 'metadata': {
-                    'segment_tokens': best_token_count,
+                    'segment_tokens': final_tokens,
                     'start_idx': best_start,
                     'end_idx': best_end,
                     'assistant_index': assistant_idx,
-                    'segment_type': 'smart_stop_coT' if best_token_count >= 5000 else 'focused_coT',
+                    'segment_type': 'consistent_coT',
                     'context_length': len(context),
-                    'target_length': len(target_msg['content']) if target_msg['content'] else 0,
+                    'target_length': len(target_content) if target_content else 0,
                     'num_assistants_in_segment': 1,
                     'quality_filter': 'substantial_content',
                     'role_normalization': True,
-                    'smart_stopping': best_token_count >= 5000
+                    'natural_stopping': final_tokens != best_token_count,
+                    'hard_limited': hard_limited,
+                    'segment_minimum': min_required,
+                    'segment_number': segments_created + 1
                 }
             })
             
-            total_generated_tokens += best_token_count
-            tokens_remaining -= best_token_count
+            total_generated_tokens += final_tokens
             used_indices.update(range(best_start, best_end))
+            segments_created += 1
             
-            stop_type = "smart stop" if best_token_count >= 5000 else "focused"
-            print(f"    Created {stop_type} segment: {best_token_count} tokens, {len(context)} context messages")
+            limit_note = " (HARD LIMITED)" if hard_limited else ""
+            natural_note = " (NATURAL STOP)" if not hard_limited and final_tokens < best_token_count else ""
+            min_note = "6000" if min_required == 6000 else "3000"
+            print(f"      Created consistent segment #{segments_created}: {final_tokens} tokens (min {min_note}), {len(context)} context messages{limit_note}{natural_note}")
             i += 1
         else:
-            # Try with minimal context if no good segment found
-            context_start = max(0, assistant_idx - 2)
-            context_end = min(len(messages), assistant_idx + 2)
+            # Fallback: try larger context to reach minimum tokens (6000 preferred, 3000 fallback)
+            min_preferred_tokens = 6000
+            min_fallback_tokens = 3000
             
-            context_msgs = messages[context_start:assistant_idx]
-            segment_msgs = messages[context_start:context_end]
-            
-            if (len(context_msgs) > 0 and
-                not used_indices.intersection(range(context_start, context_end)) and
-                is_substantial_content(target_msg.get('content', ''))):
+            for fallback_context in range(5, min(20, assistant_idx + 1)):
+                context_start = max(0, assistant_idx - fallback_context)
+                context_end = min(len(messages), assistant_idx + 8)  # More future context
                 
-                segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
-                segment_tokens = count_tokens(segment_text)
+                if used_indices.intersection(range(context_start, context_end)):
+                    continue
                 
-                if segment_tokens >= 500 and segment_tokens <= min(target_tokens, tokens_remaining):
+                context_msgs = messages[context_start:assistant_idx]
+                segment_msgs = messages[context_start:context_end]
+                
+                target_msg = messages[assistant_idx]
+                if (len(context_msgs) > 0 and
+                    is_substantial_content(target_msg.get('content', ''))):
+                    
+                    segment_text = "\n".join([f"{m['role']}: {m['content']}" for m in segment_msgs])
+                    segment_tokens = count_tokens(segment_text)
+                    
+                    # Check if we meet the preferred 6000 token minimum
+                    if segment_tokens >= min_preferred_tokens:
+                        # Apply natural stopping refinement after reaching 6000 tokens
+                        final_tokens = segment_tokens
+                        final_target_content = target_msg['content']
+                        hard_limited = False
+                        min_required = min_preferred_tokens
+                        
+                        # Apply natural stopping if segment is over 6000
+                        if segment_tokens > min_preferred_tokens:
+                            optimal_stop = find_optimal_segment_stop(segment_text)
+                            
+                            # If natural stop found and keeps us above 6000, use it
+                            if optimal_stop < len(segment_text):
+                                trimmed_text = segment_text[:optimal_stop]
+                                trimmed_tokens = count_tokens(trimmed_text)
+                                
+                                if trimmed_tokens >= min_preferred_tokens:
+                                    # Update content with trimmed version
+                                    context_text = '\n'.join([f"{m['role']}: {m['content']}" for m in context_msgs])
+                                    context_tokens = count_tokens(context_text)
+                                    remaining_for_target = target_tokens - context_tokens
+                                    if remaining_for_target > 0 and target_msg['content']:
+                                        target_char_limit = min(len(target_msg['content']), int(remaining_for_target * 4))
+                                        final_target_content = target_msg['content'][:target_char_limit]
+                                    
+                                    final_tokens = trimmed_tokens
+                        
+                        # Apply hard limit enforcement if still over 6144, but only if it keeps us above 6000
+                        if final_tokens > target_tokens:
+                            # Apply hard limiting and check if result is still above 6000
+                            # Simple truncation approach to avoid complex calculations
+                            max_chars = min(len(segment_text), 25000)  # Rough char limit for 6144 tokens
+                            trimmed_segment_text = segment_text[:max_chars]
+                            test_tokens = count_tokens(trimmed_segment_text)
+                            
+                            # If still over limit, use a more precise approach
+                            if test_tokens > target_tokens:
+                                # Calculate target char count based on token ratio
+                                char_ratio = len(segment_text) / test_tokens
+                                target_chars = int(target_tokens * char_ratio * 0.95)  # Add buffer
+                                target_chars = max(1, min(target_chars, len(segment_text)))
+                                
+                                trimmed_segment_text = segment_text[:target_chars]
+                                test_tokens = count_tokens(trimmed_segment_text)
+                            
+                            # Only proceed with hard limiting if result is still >= 6000 tokens
+                            if test_tokens >= min_preferred_tokens:
+                                final_tokens = test_tokens
+                                hard_limited = True
+                                
+                                # Trim target content proportionally
+                                context_tokens = count_tokens('\n'.join([f"{m['role']}: {m['content']}" for m in context_msgs]))
+                                remaining_for_target = target_tokens - context_tokens
+                                if remaining_for_target > 0 and target_msg['content']:
+                                    target_char_limit = min(len(target_msg['content']), int(remaining_for_target * 4))  # 4 chars per token approx
+                                    final_target_content = target_msg['content'][:target_char_limit]
+                            else:
+                                # Skip this segment as hard limiting would drop it below 6000 tokens
+                                print(f"      Skipped fallback segment: would drop below 6000 tokens after hard limiting")
+                                continue
+                    
+                    # If not enough for 6000, check if we meet the 3000 fallback minimum
+                    elif segment_tokens >= min_fallback_tokens:
+                        # Use fallback segment with 3000 minimum to prevent data loss
+                        final_tokens = segment_tokens
+                        final_target_content = target_msg['content']
+                        hard_limited = False
+                        min_required = min_fallback_tokens
+                        
+                        # Apply natural stopping if segment is over 3000
+                        if segment_tokens > min_fallback_tokens:
+                            optimal_stop = find_optimal_segment_stop(segment_text)
+                            
+                            # If natural stop found and keeps us above 3000, use it
+                            if optimal_stop < len(segment_text):
+                                trimmed_text = segment_text[:optimal_stop]
+                                trimmed_tokens = count_tokens(trimmed_text)
+                                
+                                if trimmed_tokens >= min_fallback_tokens:
+                                    # Update content with trimmed version
+                                    context_text = '\n'.join([f"{m['role']}: {m['content']}" for m in context_msgs])
+                                    context_tokens = count_tokens(context_text)
+                                    remaining_for_target = target_tokens - context_tokens
+                                    if remaining_for_target > 0 and target_msg['content']:
+                                        target_char_limit = min(len(target_msg['content']), int(remaining_for_target * 4))
+                                        final_target_content = target_msg['content'][:target_char_limit]
+                                    
+                                    final_tokens = trimmed_tokens
+                        
+                        # Apply hard limit enforcement if still over 6144, but only if it keeps us above 3000
+                        if final_tokens > target_tokens:
+                            # Apply hard limiting and check if result is still above 3000
+                            # Simple truncation approach to avoid complex calculations
+                            max_chars = min(len(segment_text), 25000)  # Rough char limit for 6144 tokens
+                            trimmed_segment_text = segment_text[:max_chars]
+                            test_tokens = count_tokens(trimmed_segment_text)
+                            
+                            # If still over limit, use a more precise approach
+                            if test_tokens > target_tokens:
+                                # Calculate target char count based on token ratio
+                                char_ratio = len(segment_text) / test_tokens
+                                target_chars = int(target_tokens * char_ratio * 0.95)  # Add buffer
+                                target_chars = max(1, min(target_chars, len(segment_text)))
+                                
+                                trimmed_segment_text = segment_text[:target_chars]
+                                test_tokens = count_tokens(trimmed_segment_text)
+                            
+                            # Only proceed with hard limiting if result is still >= 3000 tokens
+                            if test_tokens >= min_fallback_tokens:
+                                final_tokens = test_tokens
+                                hard_limited = True
+                                
+                                # Trim target content proportionally
+                                context_tokens = count_tokens('\n'.join([f"{m['role']}: {m['content']}" for m in context_msgs]))
+                                remaining_for_target = target_tokens - context_tokens
+                                if remaining_for_target > 0 and target_msg['content']:
+                                    target_char_limit = min(len(target_msg['content']), int(remaining_for_target * 4))  # 4 chars per token approx
+                                    final_target_content = target_msg['content'][:target_char_limit]
+                            else:
+                                # Skip this segment as hard limiting would drop it below 3000 tokens
+                                print(f"      Skipped fallback segment: would drop below 3000 tokens after hard limiting")
+                                continue
+                    else:
+                        # Not enough tokens for either minimum, skip this segment
+                        continue
+                    
                     segments.append({
                         'input_context': context_msgs,
-                        'target_action': target_msg['content'],
+                        'target_action': final_target_content,
                         'metadata': {
-                            'segment_tokens': segment_tokens,
+                            'segment_tokens': final_tokens,
                             'start_idx': context_start,
                             'end_idx': context_end,
                             'assistant_index': assistant_idx,
-                            'segment_type': 'minimal_focused',
+                            'segment_type': 'fallback_coT',
                             'context_length': len(context_msgs),
-                            'target_length': len(target_msg['content']) if target_msg['content'] else 0,
+                            'target_length': len(final_target_content) if final_target_content else 0,
                             'num_assistants_in_segment': 1,
-                            'quality_filter': 'minimal_substantial',
+                            'quality_filter': 'substantial_content',
                             'role_normalization': True,
-                            'smart_stopping': False
+                            'natural_stopping': final_tokens != segment_tokens,
+                            'hard_limited': hard_limited,
+                            'segment_minimum': min_required,
+                            'segment_number': segments_created + 1
                         }
                     })
                     
-                    total_generated_tokens += segment_tokens
-                    tokens_remaining -= segment_tokens
+                    total_generated_tokens += final_tokens
                     used_indices.update(range(context_start, context_end))
+                    segments_created += 1
                     
-                    print(f"    Created minimal focused segment: {segment_tokens} tokens")
+                    limit_note = " (HARD LIMITED)" if hard_limited else ""
+                    natural_note = " (NATURAL STOP)" if not hard_limited and final_tokens < segment_tokens else ""
+                    min_note = "6000" if min_required == 6000 else "3000"
+                    print(f"      Created fallback segment #{segments_created}: {final_tokens} tokens (min {min_note}), {len(context_msgs)} context{limit_note}{natural_note}")
                     i += 1
-                else:
-                    i += 1
+                    break
             else:
+                print(f"      Skipped assistant {i+1}: could not reach minimum tokens (6000 preferred, 3000 fallback)")
                 i += 1
+                
+        # Progress tracking
+        if i % 5 == 0 and i > 0:
+            print(f"    Progress: {i}/{len(substantial_assistants)} assistants processed, {segments_created} segments created")
     
     # Sort segments by start_idx
     segments.sort(key=lambda x: x['metadata']['start_idx'])
@@ -764,7 +1105,7 @@ def process_trajectory_file_to_single_file(file_path: Path, output_file) -> Dict
         
         print(f"  Created {segments_written} segments, {preservation:.1f}% preservation")
         print(f"  Role normalization: Applied to all messages")
-        print(f"  Smart stopping: Active (natural breaks after 5000 tokens)")
+        print(f"  Consistent segmentation: Minimum 6000 tokens, natural stops, max 6144")
         
         # Show segment types and token stats
         segment_types = {}
@@ -833,9 +1174,9 @@ def main():
             print("\nModes:")
             print("  (default)  - Process trajectory files with smart stopping CoT segmentation")
             print("  export     - Export all workspace files to JSONL format")
-            print("\nSmart Stopping Features:")
-            print("  - Looks for natural stopping points after 5000 tokens")
-            print("  - Maximum segment size: 6144 tokens")
+            print("\nConsistent Segmentation Features:")
+            print("  - Every segment has minimum 6000 tokens with natural code/chat endings")
+            print("  - Hard stop at 6144 tokens maximum")
             print("  - All output consolidated to single JSONL file")
             print("  - Filters out boilerplate and back-and-forth conversation")
             print("  - Target preservation: 70% (focuses on substantial content)")
@@ -846,8 +1187,8 @@ def main():
     
     # Default mode: trajectory segmentation with single output file
     print("="*80)
-    print("SMART STOPPING CHAIN OF THOUGHT TRAJECTORY SEGMENTATION")
-    print("Looks for natural stopping points after 5000 tokens, max 6144")
+    print("CONSISTENT CHAIN OF THOUGHT TRAJECTORY SEGMENTATION")
+    print("Every segment: Minimum 6000 tokens (3000 fallback), natural code/chat endings, hard stop 6144")
     print("All output consolidated to single JSONL file")
     print("Filters boilerplate and focuses on substantial reasoning content")
     print("Target preservation: 70% (selects best content for CoT learning)")
@@ -924,7 +1265,7 @@ def main():
     print(f"\nConsolidated output file: {output_file}")
     print(f"Total segments written: {total_segments_written}")
     print(f"Role normalization: Applied to all segments")
-    print(f"Smart stopping: Active (natural breaks after 5000 tokens, max 6144)")
+    print(f"Consistent segmentation: Every segment minimum 6000 tokens, natural stops, max 6144")
 
 if __name__ == "__main__":
     exit(main())
